@@ -28,10 +28,12 @@ python -m vllm.entrypoints.openai.api_server --model openai/whisper-large-v3-tur
 ./run_vllm.sh
 ```
 
-Then, run the wrapper:
+Then, run the wrapper (specify the number of workers according to your GPU - vllm will hint how many parallel requests it can handle):
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+# Example vLLM initialization output:
+# Maximum concurrency for 448 tokens per request: 20.5x
+uvicorn api:app --host 0.0.0.0 --port 8000 --workers 20
 ```
 
 Access the swagger UI at http://localhost:8000/docs to check it out.
