@@ -1,4 +1,4 @@
-import torch, io, subprocess, webrtcvad, struct, traceback, base64, aiohttp, asyncio
+import torch, io, asyncio, webrtcvad, struct, traceback, base64, aiohttp
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from openai import AsyncOpenAI
 import soundfile as sf
@@ -14,9 +14,9 @@ client = AsyncOpenAI(
 print("Loading WebRTC VAD...")
 vad = webrtcvad.Vad(3)
 
-def ffmpeg_read_from_buffer(buffer: io.BytesIO, sampling_rate=16000):
+async def ffmpeg_read_from_buffer(buffer: io.BytesIO, sampling_rate=16000):
     """
-    Reads audio from an in-memory BytesIO buffer using FFmpeg.
+    Reads audio from an in-memory BytesIO buffer using FFmpeg asynchronously.
     Returns a PyTorch tensor (float32, mono, 16kHz).
     """
     buffer.seek(0)
@@ -29,29 +29,48 @@ def ffmpeg_read_from_buffer(buffer: io.BytesIO, sampling_rate=16000):
         "-"
     ]
     try:
-        process = subprocess.run(
-            command,
-            input=buffer.read(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=True
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
         )
-        raw_data = process.stdout
-        audio_np = np.frombuffer(raw_data, dtype=np.int16)
+        stdout, _ = await process.communicate(input=buffer.read())
+        
+        if process.returncode != 0:
+            raise ValueError(f"FFmpeg failed with return code {process.returncode}")
+        
+        audio_np = np.frombuffer(stdout, dtype=np.int16)
         audio_float = audio_np.astype(np.float32) / 32768.0
         return torch.from_numpy(audio_float.copy())
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         raise ValueError(f"FFmpeg failed to read audio: {e}")
 
-def get_speech_segments_webrtc_from_buffer(buffer: io.BytesIO):
+async def get_speech_segments_webrtc_from_buffer(buffer: io.BytesIO):
     """
     Performs WebRTC VAD on audio from a BytesIO buffer.
     Returns (full_tensor, speech_segments)
+    
+    Note: WebRTC VAD itself is CPU-bound and synchronous, so we run it in a thread pool
     """
-    wav = ffmpeg_read_from_buffer(buffer, sampling_rate=16000)
+    wav = await ffmpeg_read_from_buffer(buffer, sampling_rate=16000)
     if wav is None:
         return None, []
 
+    # Run VAD processing in thread pool to avoid blocking
+    loop = asyncio.get_event_loop()
+    full_tensor, speech_segments = await loop.run_in_executor(
+        None, 
+        _process_vad, 
+        wav
+    )
+    
+    return full_tensor, speech_segments
+
+def _process_vad(wav):
+    """
+    Synchronous VAD processing - called from executor
+    """
     audio_np = (wav.numpy() * 32768).astype(np.int16)
     frame_duration_ms = 30
     frame_size = int(16000 * frame_duration_ms / 1000)
@@ -82,10 +101,14 @@ def get_speech_segments_webrtc_from_buffer(buffer: io.BytesIO):
     full_tensor = torch.from_numpy(audio_np.astype(np.float32) / 32768.0)
     return full_tensor, speech_segments
 
-def process_audio_with_vad(wav_tensor, speech_timestamps, sampling_rate=16000):
+async def process_audio_with_vad(wav_tensor, speech_timestamps, sampling_rate=16000):
+    """
+    Async version of audio processing with VAD
+    """
     if not speech_timestamps:
         return None, None
 
+    # Prepare chunks and time mapping (fast, keep synchronous)
     audio_chunks = []
     time_mapping = []
     current_proc_time = 0.0
@@ -109,35 +132,57 @@ def process_audio_with_vad(wav_tensor, speech_timestamps, sampling_rate=16000):
     final_tensor = torch.cat(audio_chunks)
     final_audio_np = final_tensor.numpy()
 
-    # Write to in-memory WAV
-    temp_wav = io.BytesIO()
-    sf.write(temp_wav, final_audio_np, sampling_rate, format='WAV', subtype='PCM_16')
-    temp_wav.seek(0)
-
-    # Compress to MP3 via FFmpeg
-    process = subprocess.Popen(
-        [
-            'ffmpeg',
-            '-i', 'pipe:0',
-            '-ar', str(sampling_rate),
-            '-ac', '1',
-            '-codec:a', 'libmp3lame',
-            '-b:a', '64k',
-            '-f', 'mp3',
-            'pipe:1'
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
+    # Run soundfile write in thread pool (I/O operation)
+    loop = asyncio.get_event_loop()
+    temp_wav = await loop.run_in_executor(
+        None,
+        _write_wav_to_buffer,
+        final_audio_np,
+        sampling_rate
     )
 
-    compressed_audio, _ = process.communicate(input=temp_wav.read())
+    # Compress to MP3 via FFmpeg asynchronously
+    compressed_audio = await _compress_to_mp3(temp_wav, sampling_rate)
+    
     buffer = io.BytesIO(compressed_audio)
     buffer.seek(0)
 
     return buffer, time_mapping
 
+def _write_wav_to_buffer(audio_np, sampling_rate):
+    """
+    Synchronous WAV writing - called from executor
+    """
+    temp_wav = io.BytesIO()
+    sf.write(temp_wav, audio_np, sampling_rate, format='WAV', subtype='PCM_16')
+    temp_wav.seek(0)
+    return temp_wav
+
+async def _compress_to_mp3(wav_buffer: io.BytesIO, sampling_rate: int) -> bytes:
+    """
+    Async FFmpeg MP3 compression
+    """
+    process = await asyncio.create_subprocess_exec(
+        'ffmpeg',
+        '-i', 'pipe:0',
+        '-ar', str(sampling_rate),
+        '-ac', '1',
+        '-codec:a', 'libmp3lame',
+        '-b:a', '64k',
+        '-f', 'mp3',
+        'pipe:1',
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL
+    )
+
+    stdout, _ = await process.communicate(input=wav_buffer.read())
+    return stdout
+
 def map_timestamp(processed_time, mapping):
+    """
+    Maps processed timestamp back to original audio timestamp
+    """
     for segment in mapping:
         if segment['proc_start'] <= processed_time <= segment['proc_end']:
             offset = processed_time - segment['proc_start']
@@ -150,6 +195,9 @@ def map_timestamp(processed_time, mapping):
     return processed_time
 
 async def download_file_from_url(url: str) -> io.BytesIO:
+    """
+    Downloads file from URL asynchronously
+    """
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
@@ -168,6 +216,9 @@ async def download_file_from_url(url: str) -> io.BytesIO:
         raise HTTPException(status_code=400, detail=f"Unexpected error during download: {str(e)}")
 
 def decode_base64_audio(b64_str: str) -> io.BytesIO:
+    """
+    Decodes base64 audio string to BytesIO
+    """
     try:
         # Handle data URI if present
         if b64_str.startswith("data:"):
@@ -183,6 +234,9 @@ async def transcribe(
     base64_audio: str = Form(None),
     url: str = Form(None)
 ):
+    """
+    Transcribe audio from file upload, base64 string, or URL
+    """
     # Validate exactly one input method
     provided = sum(x is not None for x in [file, base64_audio, url])
     if provided == 0:
@@ -201,8 +255,8 @@ async def transcribe(
         else:
             raise HTTPException(status_code=400, detail="No valid audio input provided.")
 
-        # Run VAD
-        wav_data, timestamps = get_speech_segments_webrtc_from_buffer(audio_buffer)
+        # Run VAD (now async)
+        wav_data, timestamps = await get_speech_segments_webrtc_from_buffer(audio_buffer)
 
         if not timestamps:
             return {
@@ -211,8 +265,8 @@ async def transcribe(
                 "message": "No speech detected."
             }
 
-        # Process and compress
-        processed_buffer, time_map = process_audio_with_vad(wav_data, timestamps)
+        # Process and compress (now async)
+        processed_buffer, time_map = await process_audio_with_vad(wav_data, timestamps)
 
         if processed_buffer is None:
             return {
@@ -231,6 +285,9 @@ async def transcribe(
         )
 
         def filter_and_map_segments(segments):
+            """
+            Filters low-quality segments and maps timestamps back to original
+            """
             filtered = []
             last_text = None
             repetition_count = 0
@@ -241,9 +298,12 @@ async def transcribe(
 
                 text = segment.text.strip()
                 # Skip low-quality segments
-                if segment.no_speech_prob and segment.no_speech_prob >= 0.6: continue
-                if segment.avg_logprob and segment.avg_logprob <= -1.0: continue
-                if abs(segment.start - segment.end) < 0.05: continue
+                if segment.no_speech_prob and segment.no_speech_prob >= 0.6: 
+                    continue
+                if segment.avg_logprob and segment.avg_logprob <= -1.0: 
+                    continue
+                if abs(segment.start - segment.end) < 0.05: 
+                    continue
 
                 # Avoid repetitions
                 if text == last_text:
