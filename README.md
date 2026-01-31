@@ -20,7 +20,7 @@ Install linux dependencies:
 sudo apt install ffmpeg -y
 ```
 
-Then, run the server (not we are disabling prefix caching because it most likely won´t matter for audio processing):
+Then, run the server (note we are disabling prefix caching because it most likely won´t matter for audio processing):
 
 ```bash
 python -m vllm.entrypoints.openai.api_server --model openai/whisper-large-v3-turbo --port 8001 --host 0.0.0.0 --enforce-eager --no-enable-prefix-caching
