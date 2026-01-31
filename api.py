@@ -1,12 +1,12 @@
 import torch, io, subprocess, webrtcvad, struct, traceback, base64, aiohttp, asyncio
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
-from openai import OpenAI
+from openai import AsyncOpenAI
 import soundfile as sf
 import numpy as np
 
 app = FastAPI()
 
-client = OpenAI(
+client = AsyncOpenAI(
     api_key="EMPTY",
     base_url="http://localhost:8001/v1"
 )
@@ -222,7 +222,7 @@ async def transcribe(
             }
 
         # Transcribe with Whisper via vLLM
-        transcription = client.audio.transcriptions.create(
+        transcription = await client.audio.transcriptions.create(
             model="openai/whisper-large-v3-turbo",
             file=("audio.mp3", processed_buffer, "audio/mpeg"),
             response_format="verbose_json",
