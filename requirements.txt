@@ -1,0 +1,12 @@
+vllm
+openai
+soundfile
+ipykernel
+vllm[audio]
+librosa
+numpy
+torch
+webrtcvad
+uvicorn[standard]
+fastapi
+aiohttp
